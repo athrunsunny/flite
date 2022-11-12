@@ -272,7 +272,7 @@ def form_net(opt, device, output=False, phase='train'):
         net = eval(net_info[opt.network][0])(cfg=cfg)
     else:
         cfg = eval(net_info[opt][1])
-        net = eval(net_info[opt][0])(cfg=cfg)
+        net = eval(net_info[opt][0])(cfg=cfg, phase='test')
     if output:
         prefix = colorstr('Net: ')
         LOGGER.info(f"{prefix} {net}")
