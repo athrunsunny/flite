@@ -1,6 +1,7 @@
 import random
 import torch
 import os
+import cv2
 import numpy as np
 import pkg_resources as pkg
 import platform
@@ -12,6 +13,8 @@ import urllib
 import sys
 import glob
 import inspect
+import IPython
+import contextlib
 from typing import Optional
 from pathlib import Path
 from subprocess import check_output
@@ -32,6 +35,24 @@ DATASETS_DIR = Path(os.getenv('YOLOv5_DATASETS_DIR', ROOT.parent / 'datasets'))
 FONT = 'Arial.ttf'  # https://ultralytics.com/assets/Arial.ttf
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
 
+
+def is_notebook():
+    # Is environment a Jupyter notebook? Verified on Colab, Jupyterlab, Kaggle, Paperspace
+    ipython_type = str(type(IPython.get_ipython()))
+    return 'colab' in ipython_type or 'zmqshell' in ipython_type
+
+
+def is_docker() -> bool:
+    """Check if the process runs inside a docker container."""
+    if Path("/.dockerenv").exists():
+        return True
+    try:  # check if docker is in control groups
+        with open("/proc/self/cgroup") as file:
+            return any("docker" in line for line in file)
+    except OSError:
+        return False
+
+
 def is_ascii(s=''):
     # Is string composed of all ASCII (no UTF) characters? (note str().isascii() introduced in python 3.7)
     s = str(s)  # convert list, tuple, None, etc. to str
@@ -51,6 +72,11 @@ def is_kaggle():
 def is_colab():
     # Is environment a Google Colab instance?
     return 'COLAB_GPU' in os.environ
+
+
+def clean_str(s):
+    # Cleans a string by replacing special characters with underscore _
+    return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨´><+]", repl="_", string=s)
 
 
 def emojis(str=''):
@@ -225,24 +251,28 @@ def select_device(device='', batch_size=0, newline=True):
     return torch.device(arg)
 
 
-def form_net(opt, device, output=False):
+def form_net(opt, device, output=False, phase='train'):
     net_info = {'mobile0.25': ['RetinaFace', 'cfg_mnet'],
                 'slim': ['Slim', 'cfg_slim'],
                 'RFB': ['RFB', 'cfg_rfb']}
     cuda = device.type != 'cpu'
 
-    if opt.network not in net_info:
-        LOGGER.info("Don't support this network!")
-        exit(0)
+    if phase == 'train':
+        if opt.network not in net_info:
+            LOGGER.info("Don't support this network!")
+            exit(0)
 
-    cfg = eval(net_info[opt.network][1])
-    cfg['gpu_train'] = cuda
-    cfg['image_size'] = opt.img_size
-    cfg['ngpu'] = opt.num_gpu
-    cfg['batch_size'] = opt.batch_size
-    cfg['epoch'] = opt.epochs
+        cfg = eval(net_info[opt.network][1])
+        cfg['gpu_train'] = cuda
+        cfg['image_size'] = opt.img_size
+        cfg['ngpu'] = opt.num_gpu
+        cfg['batch_size'] = opt.batch_size
+        cfg['epoch'] = opt.epochs
 
-    net = eval(net_info[opt.network][0])(cfg=cfg)
+        net = eval(net_info[opt.network][0])(cfg=cfg)
+    else:
+        cfg = eval(net_info[opt][1])
+        net = eval(net_info[opt][0])(cfg=cfg)
     if output:
         prefix = colorstr('Net: ')
         LOGGER.info(f"{prefix} {net}")
@@ -438,9 +468,12 @@ def check_file(file, suffix=''):
         assert len(files), f'File not found: {file}'  # assert file was found
         assert len(files) == 1, f"Multiple files match '{file}', specify exact path: {files}"  # assert unique
         return files[0]  # return file
+
+
 def check_yaml(file, suffix=('.yaml', '.yml')):
     # Search/download YAML file (if necessary) and return path, checking suffix
     return check_file(file, suffix)
+
 
 def smart_DDP(model):
     # Model DDP creation with checks
@@ -451,6 +484,15 @@ def smart_DDP(model):
         return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, static_graph=True)
     else:
         return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+
+
+def smart_inference_mode(torch_1_9=check_version(torch.__version__, '1.9.0')):
+    # Applies torch.inference_mode() decorator if torch>=1.9.0 else torch.no_grad() decorator
+    def decorate(fn):
+        return (torch.inference_mode if torch_1_9 else torch.no_grad)()(fn)
+
+    return decorate
+
 
 def xyxy2xywh(x):
     # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
@@ -470,3 +512,69 @@ def xywh2xyxy(x):
     y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
     y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
     return y
+
+
+def check_imshow(warn=False):
+    # Check if environment supports image displays
+    try:
+        assert not is_notebook()
+        assert not is_docker()
+        cv2.imshow('test', np.zeros((1, 1, 3)))
+        cv2.waitKey(1)
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+        return True
+    except Exception as e:
+        if warn:
+            LOGGER.warning(f'WARNING ⚠️ Environment does not support cv2.imshow() or PIL Image.show()\n{e}')
+        return False
+
+
+class Profile(contextlib.ContextDecorator):
+    def __init__(self, t=0.0):
+        self.t = t
+        self.cuda = torch.cuda.is_available()
+
+    def __enter__(self):
+        self.start = self.time()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.dt = self.time() - self.start  # delta-time
+        self.t += self.dt  # accumulate dt
+
+    def time(self):
+        if self.cuda:
+            torch.cuda.synchronize()
+        return time.time()
+
+
+def check_keys(model, pretrained_state_dict):
+    ckpt_keys = set(pretrained_state_dict.keys())
+    model_keys = set(model.state_dict().keys())
+    used_pretrained_keys = model_keys & ckpt_keys
+    # unused_pretrained_keys = ckpt_keys - model_keys
+    # missing_keys = model_keys - ckpt_keys
+    assert len(used_pretrained_keys) > 0, 'load NONE from pretrained checkpoint'
+    return True
+
+
+def remove_prefix(state_dict, prefix):
+    ''' Old style model is stored with all names of parameters sharing common prefix 'module.' '''
+    f = lambda x: x.split(prefix, 1)[-1] if x.startswith(prefix) else x
+    return {f(key): value for key, value in state_dict.items()}
+
+
+def load_model(model, pretrained_path, load_to_cpu):
+    if load_to_cpu:
+        pretrained_dict = torch.load(pretrained_path, map_location=lambda storage, loc: storage)
+    else:
+        device = torch.cuda.current_device()
+        pretrained_dict = torch.load(pretrained_path, map_location=lambda storage, loc: storage.cuda(device))
+    if "state_dict" in pretrained_dict.keys():
+        pretrained_dict = remove_prefix(pretrained_dict['state_dict'], 'module.')
+    else:
+        pretrained_dict = remove_prefix(pretrained_dict, 'module.')
+    check_keys(model, pretrained_dict)
+    model.load_state_dict(pretrained_dict, strict=False)
+    return model
