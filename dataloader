@@ -4,19 +4,26 @@ import math
 import os
 import random
 import shutil
+import time
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-
+from threading import Thread
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from utils.general import torch_distributed_zero_first,xywh2xyxy
 
+from utils.general import torch_distributed_zero_first, LOGGER, is_colab, is_kaggle,clean_str
+
+IMG_FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp', 'pfm'  # include image suffixes
+VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
+BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'  # tqdm bar format
+LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
+RANK = int(os.getenv('RANK', -1))
+PIN_MEMORY = str(os.getenv('PIN_MEMORY', True)).lower() == 'true'  # global pin_memory for dataloaders
 
 def xyxy2xywh(x):
     # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
@@ -141,7 +148,7 @@ class _RepeatSampler(object):
 
 class LoadFaceImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='',rgb_means=(104, 117, 123)):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', rgb_means=(104, 117, 123)):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -338,7 +345,7 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
 
         image_t, boxes_t, labels_t, landm_t, pad_image_flag = _crop(image, boxes, labels, landm, self.img_size)
         image_t = _distort(image_t)
-        image_t = _pad_to_square(image_t,self.rgb_means, pad_image_flag)
+        image_t = _pad_to_square(image_t, self.rgb_means, pad_image_flag)
         image_t, boxes_t, landm_t = _mirror(image_t, boxes_t, landm_t)
         height, width, _ = image_t.shape
         image_t = _resize_subtract_mean(image_t, self.img_size, self.rgb_means)
@@ -352,7 +359,6 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
         targets_t = np.hstack((boxes_t, landm_t, labels_t))
 
         return torch.from_numpy(image_t), targets_t, self.img_files[index], (h0, w0)
-
 
     def __getitem1__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
@@ -508,7 +514,7 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                     annos = torch.from_numpy(tup).float()
                     targets.append(annos)
 
-        return torch.stack(imgs, 0), targets ,_,_
+        return torch.stack(imgs, 0), targets, _, _
 
     # @staticmethod
     # def collate_fn4(batch):
@@ -1023,6 +1029,7 @@ def convert(size, box):
     tmp[:, 3:4] = tmp[:, 3:4] * dh
     return tmp
 
+
 def matrix_iof(a, b):
     """
     return iof of a and b, numpy version for data augenmentation
@@ -1033,6 +1040,7 @@ def matrix_iof(a, b):
     area_i = np.prod(rb - lt, axis=2) * (lt < rb).all(axis=2)
     area_a = np.prod(a[:, 2:] - a[:, :2], axis=1)
     return area_i / np.maximum(area_a[:, np.newaxis], 1)
+
 
 def _crop(image, boxes, labels, landm, img_dim):
     height, width, _ = image.shape
@@ -1087,8 +1095,7 @@ def _crop(image, boxes, labels, landm, img_dim):
         landms_t[:, :, :2] = np.minimum(landms_t[:, :, :2], roi[2:] - roi[:2])
         landms_t = landms_t.reshape([-1, 10])
 
-
-	# make sure that the cropped image contains at least one face > 16 pixel at training image scale
+        # make sure that the cropped image contains at least one face > 16 pixel at training image scale
         b_w_t = (boxes_t[:, 2] - boxes_t[:, 0] + 1) / w * img_dim
         b_h_t = (boxes_t[:, 3] - boxes_t[:, 1] + 1) / h * img_dim
         mask_b = np.minimum(b_w_t, b_h_t) > 5
@@ -1106,7 +1113,6 @@ def _crop(image, boxes, labels, landm, img_dim):
 
 
 def _distort(image):
-
     def _convert(image, alpha=1, beta=0):
         tmp = image.astype(float) * alpha + beta
         tmp[tmp < 0] = 0
@@ -1117,21 +1123,21 @@ def _distort(image):
 
     if random.randrange(2):
 
-        #brightness distortion
+        # brightness distortion
         if random.randrange(2):
             _convert(image, beta=random.uniform(-32, 32))
 
-        #contrast distortion
+        # contrast distortion
         if random.randrange(2):
             _convert(image, alpha=random.uniform(0.5, 1.5))
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        #saturation distortion
+        # saturation distortion
         if random.randrange(2):
             _convert(image[:, :, 1], alpha=random.uniform(0.5, 1.5))
 
-        #hue distortion
+        # hue distortion
         if random.randrange(2):
             tmp = image[:, :, 0].astype(int) + random.randint(-18, 18)
             tmp %= 180
@@ -1141,17 +1147,17 @@ def _distort(image):
 
     else:
 
-        #brightness distortion
+        # brightness distortion
         if random.randrange(2):
             _convert(image, beta=random.uniform(-32, 32))
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-        #saturation distortion
+        # saturation distortion
         if random.randrange(2):
             _convert(image[:, :, 1], alpha=random.uniform(0.5, 1.5))
 
-        #hue distortion
+        # hue distortion
         if random.randrange(2):
             tmp = image[:, :, 0].astype(int) + random.randint(-18, 18)
             tmp %= 180
@@ -1159,7 +1165,7 @@ def _distort(image):
 
         image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
 
-        #contrast distortion
+        # contrast distortion
         if random.randrange(2):
             _convert(image, alpha=random.uniform(0.5, 1.5))
 
@@ -1233,6 +1239,7 @@ def _resize_subtract_mean(image, insize, rgb_mean):
     image -= rgb_mean
     return image.transpose(2, 0, 1)
 
+
 def convert_scale(size, box):
     tmp = np.zeros_like(box)
     dw = 1. / (size[0])
@@ -1242,3 +1249,199 @@ def convert_scale(size, box):
     tmp[:, 1:2] = box[:, 1:2] * dh
     tmp[:, 3:4] = box[:, 3:4] * dh
     return tmp
+
+
+class LoadImages:
+    def __init__(self, path, img_size=640, auto=True, transforms=None, vid_stride=1,oresize=False):
+        files = []
+        for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
+            p = str(Path(p).resolve())
+            if '*' in p:
+                files.extend(sorted(glob.glob(p, recursive=True)))  # glob
+            elif os.path.isdir(p):
+                files.extend(sorted(glob.glob(os.path.join(p, '*.*'))))  # dir
+            elif os.path.isfile(p):
+                files.append(p)  # files
+            else:
+                raise FileNotFoundError(f'{p} does not exist')
+
+        images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
+        videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
+        ni, nv = len(images), len(videos)
+
+        self.img_size = img_size
+        self.files = images + videos
+        self.nf = ni + nv  # number of files
+        self.video_flag = [False] * ni + [True] * nv
+        self.mode = 'image'
+        self.auto = auto
+        self.transforms = transforms  # optional
+        self.vid_stride = vid_stride  # video frame-rate stride
+        self.origin_size = oresize
+        if any(videos):
+            self._new_video(videos[0])  # new video
+        else:
+            self.cap = None
+        assert self.nf > 0, f'No images or videos found in {p}. ' \
+                            f'Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}'
+
+    def __iter__(self):
+        self.count = 0
+        return self
+
+    def __next__(self):
+        if self.count == self.nf:
+            raise StopIteration
+        path = self.files[self.count]
+
+        if self.video_flag[self.count]:
+            # Read video
+            self.mode = 'video'
+            for _ in range(self.vid_stride):
+                self.cap.grab()
+            ret_val, im0 = self.cap.retrieve()
+            while not ret_val:
+                self.count += 1
+                self.cap.release()
+                if self.count == self.nf:  # last video
+                    raise StopIteration
+                path = self.files[self.count]
+                self._new_video(path)
+                ret_val, im0 = self.cap.read()
+
+            self.frame += 1
+            # im0 = self._cv2_rotate(im0)  # for use if cv2 autorotation is False
+            s = f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: '
+
+        else:
+            # Read image
+            self.count += 1
+            im0 = cv2.imread(path)  # BGR
+            assert im0 is not None, f'Image Not Found {path}'
+            s = f'image {self.count}/{self.nf} {path}: '
+
+        if self.transforms:
+            im = self.transforms(im0)  # transforms
+            resize = 1
+        else:
+            max_size = self.img_size
+            im_shape = im0.shape
+            ori_height,ori_width = im_shape[0],im_shape[1]
+            im = np.float32(im0)
+            im_size_min = np.min(im_shape[0:2])
+            im_size_max = np.max(im_shape[0:2])
+            resize = float(self.img_size) / float(im_size_min)
+            if np.round(resize * im_size_max) > max_size:
+                resize = float(max_size) / float(im_size_max)
+            if self.origin_size:
+                resize = 1
+            if resize != 1:
+                im = cv2.resize(im, None, None, fx=resize, fy=resize, interpolation=cv2.INTER_LINEAR)
+            im_height, im_width, _ = im.shape
+
+            # scale = torch.Tensor([im.shape[1], im.shape[0], im.shape[1], im.shape[0]])
+            im -= (104, 117, 123)
+            im = im.transpose(2, 0, 1)
+
+        return path, im, im0, self.cap, s,resize
+
+    def _new_video(self, path):
+        # Create a new video capture object
+        self.frame = 0
+        self.cap = cv2.VideoCapture(path)
+        self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
+        self.orientation = int(self.cap.get(cv2.CAP_PROP_ORIENTATION_META))  # rotation degrees
+        # self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)  # disable https://github.com/ultralytics/yolov5/issues/8493
+
+    def _cv2_rotate(self, im):
+        # Rotate a cv2 video manually
+        if self.orientation == 0:
+            return cv2.rotate(im, cv2.ROTATE_90_CLOCKWISE)
+        elif self.orientation == 180:
+            return cv2.rotate(im, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif self.orientation == 90:
+            return cv2.rotate(im, cv2.ROTATE_180)
+        return im
+
+    def __len__(self):
+        return self.nf  # number of files
+
+
+class LoadStreams:
+    def __init__(self, sources='streams.txt', img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
+        torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
+        self.mode = 'stream'
+        self.img_size = img_size
+        self.stride = stride
+        self.vid_stride = vid_stride  # video frame-rate stride
+        sources = Path(sources).read_text().rsplit() if Path(sources).is_file() else [sources]
+        n = len(sources)
+        self.sources = [clean_str(x) for x in sources]  # clean source names for later
+        self.imgs, self.fps, self.frames, self.threads = [None] * n, [0] * n, [0] * n, [None] * n
+        for i, s in enumerate(sources):  # index, source
+            # Start thread to read frames from video stream
+            st = f'{i + 1}/{n}: {s}... '
+            s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
+            if s == 0:
+                assert not is_colab(), '--source 0 webcam unsupported on Colab. Rerun command in a local environment.'
+                assert not is_kaggle(), '--source 0 webcam unsupported on Kaggle. Rerun command in a local environment.'
+            cap = cv2.VideoCapture(s)
+            assert cap.isOpened(), f'{st}Failed to open {s}'
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
+            self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float('inf')  # infinite stream fallback
+            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
+
+            _, self.imgs[i] = cap.read()  # guarantee first frame
+            self.threads[i] = Thread(target=self.update, args=([i, cap, s]), daemon=True)
+            LOGGER.info(f"{st} Success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
+            self.threads[i].start()
+        LOGGER.info('')  # newline
+
+        # check for common shapes
+        s = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
+        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
+        self.auto = auto and self.rect
+        self.transforms = transforms  # optional
+        if not self.rect:
+            LOGGER.warning('WARNING ⚠️ Stream shapes differ. For optimal performance supply similarly-shaped streams.')
+
+    def update(self, i, cap, stream):
+        # Read stream `i` frames in daemon thread
+        n, f = 0, self.frames[i]  # frame number, frame array
+        while cap.isOpened() and n < f:
+            n += 1
+            cap.grab()  # .read() = .grab() followed by .retrieve()
+            if n % self.vid_stride == 0:
+                success, im = cap.retrieve()
+                if success:
+                    self.imgs[i] = im
+                else:
+                    LOGGER.warning('WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.')
+                    self.imgs[i] = np.zeros_like(self.imgs[i])
+                    cap.open(stream)  # re-open stream if signal was lost
+            time.sleep(0.0)  # wait time
+
+    def __iter__(self):
+        self.count = -1
+        return self
+
+    def __next__(self):
+        self.count += 1
+        if not all(x.is_alive() for x in self.threads) or cv2.waitKey(1) == ord('q'):  # q to quit
+            cv2.destroyAllWindows()
+            raise StopIteration
+
+        im0 = self.imgs.copy()
+        if self.transforms:
+            im = np.stack([self.transforms(x) for x in im0])  # transforms
+        else:
+            im = np.stack([letterbox(x, self.img_size, stride=self.stride, auto=self.auto)[0] for x in im0])  # resize
+            im = im[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW
+            im = np.ascontiguousarray(im)  # contiguous
+
+        return self.sources, im, im0, None, ''
+
+    def __len__(self):
+        return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
