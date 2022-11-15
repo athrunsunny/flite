@@ -1,6 +1,7 @@
 import random
 import torch
 import os
+import math
 import cv2
 import numpy as np
 import pkg_resources as pkg
@@ -578,3 +579,8 @@ def load_model(model, pretrained_path, load_to_cpu):
     check_keys(model, pretrained_dict)
     model.load_state_dict(pretrained_dict, strict=False)
     return model
+
+
+def one_cycle(y1=0.0, y2=1.0, steps=100):
+    # lambda function for sinusoidal ramp from y1 to y2 https://arxiv.org/pdf/1812.01187.pdf
+    return lambda x: ((1 - math.cos(x * math.pi / steps)) / 2) * (y2 - y1) + y1
