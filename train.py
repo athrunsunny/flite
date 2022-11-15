@@ -1,27 +1,28 @@
 from __future__ import print_function
-import os
-import torch
-import torch.optim as optim
-import torch.distributed as dist
-import torch.backends.cudnn as cudnn
+
 import argparse
-import torch.utils.data as tudata
-from data import WiderFaceDetection, detection_collate, preproc, cfg_mnet, cfg_slim, cfg_rfb
-from layers.modules import MultiBoxLoss
-from layers.functions.prior_box import PriorBox
-import time
 import datetime
 import math
+import os
 import sys
-import yaml
+import time
 from pathlib import Path
+
 import numpy as np
+import torch
+import torch.distributed as dist
+import torch.optim as optim
+import torch.utils.data as tudata
+import yaml
 from tqdm import tqdm
 
+from data import WiderFaceDetection, detection_collate, preproc
+from layers.functions.prior_box import PriorBox
+from layers.modules import MultiBoxLoss
 from utils.dataloader1 import create_dataloader
 from utils.general import init_seeds, LOGGER, print_args, increment_path, select_device, form_net, check_suffix, \
     torch_distributed_zero_first, intersect_dicts, adjust_learning_rate, check_dataset, colorstr, check_file, \
-    check_yaml, smart_DDP
+    check_yaml, smart_DDP, one_cycle
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -33,17 +34,19 @@ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
+from torch.optim import lr_scheduler
+
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser(description='Training')
     # parser.add_argument('--data', default=r'D:\Users\yl3146\Downloads\widerface\train/label.txt',
     #                     help='Training dataset directory')
-    parser.add_argument('--data', type=str, default=ROOT / 'param/widerface.yaml', help='dataset.yaml path')
+    parser.add_argument('--data', type=str, default=ROOT / 'param/key_point.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', type=str, default=ROOT / 'slim.pth', help='initial weights path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'param/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--network', default='slim', help='Backbone network mobile0.25 or slim or RFB')
     parser.add_argument('--num_workers', default=0, type=int, help='Number of workers used in dataloading')
-    parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float, help='initial learning rate')
+    parser.add_argument('--lr', '--learning-rate', default=1e-2, type=float, help='initial learning rate (origin lr=1e-3)')
     parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
     parser.add_argument('--resume_net', default=None, help='resume net for retraining')
     parser.add_argument('--resume_epoch', default=0, type=int, help='resume iter for retraining')
@@ -55,8 +58,8 @@ def parse_opt(known=False):
     parser.add_argument('--img_size', type=int, default=320, help='')
     parser.add_argument('--num_gpu', type=int, default=1, help='')
     #
-    parser.add_argument('--batch_size',type=int, default=8, help='')
-    parser.add_argument('--epochs',type=int, default=1, help='')
+    parser.add_argument('--batch_size', type=int, default=8, help='')
+    parser.add_argument('--epochs', type=int, default=100, help='')
     parser.add_argument('--name', type=str, default='exp', help='')
     parser.add_argument('--project', default=ROOT / 'runs/train-lmk', help='save to project/name')
 
@@ -72,6 +75,7 @@ def parse_opt(known=False):
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--noval', action='store_true', help='only validate final epoch')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
+    parser.add_argument('--cos-lr', action='store_true', help='cosine LR scheduler')
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
@@ -272,6 +276,7 @@ def train1(model, opt, cfg, device):
         model = smart_DDP(model)
     model.to(device)
 
+    # Optimizer
     optimizer = optim.SGD(model.parameters(), lr=opt.lr, momentum=opt.momentum, weight_decay=opt.weight_decay)
     compute_loss = MultiBoxLoss(opt.num_classes, 0.35, True, 0, True, 7, 0.35, False)
 
@@ -279,6 +284,13 @@ def train1(model, opt, cfg, device):
     with torch.no_grad():
         priors = priorbox.forward()
         priors = priors.to(device)
+
+    # Scheduler
+    if opt.cos_lr:
+        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+    else:
+        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
@@ -289,6 +301,8 @@ def train1(model, opt, cfg, device):
     start_epoch = 0
     nb = len(train_loader)
     min_loss = [10000]
+    scheduler.last_epoch = start_epoch - 1  # do not move
+
     for epoch in range(start_epoch, epochs):
         mloss = torch.zeros(3, device=device)
         model.train()
@@ -328,6 +342,12 @@ def train1(model, opt, cfg, device):
                 pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, s, imgs.shape[-1]))
             # end batch -------------------------------------------------------------------------------------
+        # Scheduler
+        lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
+        # print(lr)
+        scheduler.step()
+        LOGGER.info(f'Epoch: {epoch} LR {(lr[-1]):.8f}.')
+
         if RANK in {-1, 0}:
             if total_loss <= min_loss[-1]:
                 torch.save(model.state_dict(), best)
